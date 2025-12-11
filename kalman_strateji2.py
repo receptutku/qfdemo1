@@ -147,3 +147,5 @@ plt.yscale('log') # Logaritmik ölçek uzun vadede daha doğru gösterir
 
 print("Grafik oluşturuluyor...")
 plt.show()
+
+#Test
