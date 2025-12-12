@@ -12,3 +12,6 @@ ENV/
 dist/
 build/
 
+# Result files
+*.html
+
