@@ -45,6 +45,8 @@ class SplitMetrics:
     final_equity: float
     low_sample_flag: bool  # True if trades < 10
     total_costs: float = 0.0  # fees + slippage for this split
+    avg_position_notional: float = 0.0
+    avg_risk_used_per_trade: float = 0.0  # fraction of equity
 
 
 @dataclass
@@ -104,8 +106,13 @@ def run_split_backtest(
     strategy_name: str,
     warmup_bars: int = 200,
     fee_pct: float = 0.0005,
-    slippage_bps: float = 5.0,
-    daily_df: pd.DataFrame = None,  # For regime filter
+    slippage_bps: float = 5.0,  # Legacy, used if k not set
+    daily_df: pd.DataFrame = None,
+    sizing_mode: str = "all_in",
+    risk_per_trade: float = 0.01,
+    max_leverage: float = 1.0,
+    slippage_k: float = 0.15,
+    min_slippage_bps: float = 1.0,
 ) -> tuple:
     """
     Run backtest on a single split's test window.
@@ -115,7 +122,7 @@ def run_split_backtest(
     Returns:
         (SplitMetrics, trades_list, equity_series)
     """
-    from src.backtest import apply_slippage, Trade
+    from src.backtest import apply_volatility_slippage, Trade
     
     # Get data with warmup
     _, test_df, warmup_df = get_split_data(df_full, split, warmup_bars)
@@ -148,6 +155,10 @@ def run_split_backtest(
     total_fees = 0.0
     total_slippage = 0.0
     
+    # Position sizing tracking
+    position_notionals = []
+    risk_amounts_used = [] # as fraction of equity at entry
+    
     trades = []
     equity_history = []
     
@@ -157,6 +168,7 @@ def run_split_backtest(
         bar_open = warmup_df["open"].iloc[i]
         bar_low = warmup_df["low"].iloc[i]
         bar_close = warmup_df["close"].iloc[i]
+        itr_atr = signals_df["atr"].iloc[i]
         
         # Record equity
         current_equity = position * bar_close if position > 0 else equity
@@ -164,12 +176,14 @@ def run_split_backtest(
         
         # Check stop-loss
         if position > 0 and stop_price is not None and bar_low <= stop_price:
-            exit_price = apply_slippage(stop_price, slippage_bps, is_buy=False)
+            # Volatility slippage
+            exit_price, slip_cost = apply_volatility_slippage(
+                stop_price, itr_atr, is_buy=False, 
+                slippage_k=slippage_k, min_slippage_bps=min_slippage_bps
+            )
             exit_price = max(exit_price, bar_low)
             
-            # Track slippage cost
-            slippage_cost = abs(stop_price - exit_price) * position
-            total_slippage += slippage_cost
+            total_slippage += slip_cost * position
             
             gross_proceeds = position * exit_price
             fee = gross_proceeds * fee_pct
@@ -216,14 +230,16 @@ def run_split_backtest(
         
         # Signal change
         if signal != prev_signal:
+            # EXT & ENTRY LOGIC
+            
             # Exit
             if position > 0 and signal == 0:
-                exit_price = apply_slippage(next_open, slippage_bps, is_buy=False)
+                exit_price, slip_cost = apply_volatility_slippage(
+                    next_open, itr_atr, is_buy=False, 
+                    slippage_k=slippage_k, min_slippage_bps=min_slippage_bps
+                )
                 
-                # Track slippage cost
-                slippage_cost = abs(next_open - exit_price) * position
-                total_slippage += slippage_cost
-                
+                total_slippage += slip_cost * position
                 gross_proceeds = position * exit_price
                 fee = gross_proceeds * fee_pct
                 total_fees += fee
@@ -249,35 +265,87 @@ def run_split_backtest(
             
             # Entry
             if signal == 1 and position == 0:
-                exec_price = apply_slippage(next_open, slippage_bps, is_buy=True)
+                exec_price, entry_slip_cost = apply_volatility_slippage(
+                    next_open, itr_atr, is_buy=True, 
+                    slippage_k=slippage_k, min_slippage_bps=min_slippage_bps
+                )
                 
-                # Track slippage cost on entry
-                slippage_cost = abs(exec_price - next_open) * (equity / exec_price)  # Approximate
-                total_slippage += slippage_cost
+                # SIZING LOGIC
+                position_size_btc = 0.0
+                pos_val = 0.0
                 
-                fee = equity * fee_pct
-                total_fees += fee
-                available = equity - fee
-                
-                position = available / exec_price
-                entry_price = exec_price
-                entry_time = next_time
-                highest_close = bar_close
-                
-                atr = signals_df["atr"].iloc[i]
-                if not pd.isna(atr):
-                    stop_price = exec_price - strategy.atr_multiplier * atr
-                
-                equity = 0.0
+                if sizing_mode == "risk_per_trade":
+                    if not pd.isna(itr_atr) and itr_atr > 0:
+                        stop_dist = strategy.atr_multiplier * itr_atr
+                        if stop_dist > 0:
+                            risk_amt = equity * risk_per_trade
+                            max_notional = equity * max_leverage
+                            
+                            position_size_btc = risk_amt / stop_dist
+                            position_val = position_size_btc * exec_price
+                            if position_val > max_notional:
+                                position_val = max_notional
+                                position_size_btc = position_val / exec_price
+                            
+                            fee = position_val * fee_pct
+                            if position_val + fee > equity:
+                                cash = equity
+                                position_val = cash / (1 + fee_pct)
+                                fee = cash - position_val
+                                position_size_btc = position_val / exec_price
+                                pos_val = position_val
+                            else:
+                                pos_val = position_val
+                else:
+                    # All in
+                    trade_equity = equity
+                    fee = trade_equity * fee_pct
+                    available = trade_equity - fee
+                    position_size_btc = available / exec_price
+                    pos_val = available
+
+                if position_size_btc > 0:
+                    position = position_size_btc
+                    total_fees += fee
+                    total_slippage += entry_slip_cost * position
+                    
+                    entry_price = exec_price
+                    entry_time = next_time
+                    highest_close = bar_close
+                    
+                    # Stop logic
+                    stop_sig = signals_df["stop_price"].iloc[i]
+                    if not pd.isna(stop_sig):
+                         if not pd.isna(itr_atr):
+                             stop_price = exec_price - strategy.atr_multiplier * itr_atr
+                         else:
+                             stop_price = stop_sig
+                    else:
+                        stop_price = None
+                    
+                    # Metrics tracking
+                    position_notionals.append(pos_val)
+                    if stop_price and stop_price > 0:
+                        dist = exec_price - stop_price
+                        risk_usd = position * dist
+                        risk_pct = risk_usd / equity if equity > 0 else 0
+                        risk_amounts_used.append(risk_pct)
+                    else:
+                        risk_amounts_used.append(0.0)
+                    
+                    equity -= (pos_val + fee)
     
     # Close remaining position
     if position > 0:
         final_close = warmup_df["close"].iloc[-1]
-        exit_price = apply_slippage(final_close, slippage_bps, is_buy=False)
+        final_atr = signals_df["atr"].iloc[-1]
+        exit_price, slip_cost = apply_volatility_slippage(
+            final_close, final_atr, is_buy=False,
+            slippage_k=slippage_k, min_slippage_bps=min_slippage_bps
+        )
         
         # Track slippage cost
-        slippage_cost = abs(final_close - exit_price) * position
-        total_slippage += slippage_cost
+        total_slippage += slip_cost * position
         
         gross_proceeds = position * exit_price
         fee = gross_proceeds * fee_pct
@@ -363,6 +431,8 @@ def run_split_backtest(
         final_equity=round(final_equity, 2),
         low_sample_flag=len(trades) < 10,
         total_costs=round(total_costs, 2),
+        avg_position_notional=round(sum(position_notionals)/len(position_notionals) if position_notionals else 0.0, 2),
+        avg_risk_used_per_trade=round(sum(risk_amounts_used)/len(risk_amounts_used) if risk_amounts_used else 0.0, 4),
     )
     
     return metrics, trades, equity_series
@@ -458,6 +528,11 @@ def run_walk_forward(
     wf_mode: str = "fixed_params",
     min_trades: int = 10,
     save_reports: bool = True,
+    sizing_mode: str = "all_in",
+    risk_per_trade: float = 0.01,
+    max_leverage: float = 1.0,
+    slippage_k: float = 0.15,
+    min_slippage_bps: float = 1.0,
 ) -> WalkForwardResult:
     """
     Run walk-forward analysis across multiple time periods.
@@ -520,7 +595,13 @@ def run_walk_forward(
         else:
             # FIXED_PARAMS: Use default strategy params
             metrics, trades, equity = run_split_backtest(
-                df, split, strategy_name, warmup_bars, fee_pct, slippage_bps, daily_df=daily_df
+                df, split, strategy_name, warmup_bars, fee_pct, slippage_bps, 
+                daily_df=daily_df,
+                sizing_mode=sizing_mode,
+                risk_per_trade=risk_per_trade,
+                max_leverage=max_leverage,
+                slippage_k=slippage_k,
+                min_slippage_bps=min_slippage_bps,
             )
         
         if metrics:

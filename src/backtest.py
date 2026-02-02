@@ -85,6 +85,10 @@ class BacktestResult:
     total_fees_paid: float = 0.0
     total_slippage_cost: float = 0.0
     cost_as_pct_of_gross_pnl: float = 0.0
+    
+    # Position sizing metrics
+    avg_position_notional: float = 0.0
+    avg_risk_used_per_trade: float = 0.0  # as fraction of equity
 
 
 def apply_slippage(price: float, slippage_bps: float, is_buy: bool) -> float:
@@ -303,6 +307,10 @@ def run_backtest(
     total_fees_paid = 0.0
     total_slippage_cost = 0.0
     
+    # Position sizing tracking
+    position_notionals = []
+    risk_amounts_used = []  # as fraction of equity at entry
+    
     trades: List[Trade] = []
     equity_history = []
     
@@ -508,6 +516,18 @@ def run_backtest(
                 else:
                     stop_price = None
                 
+                # Track position sizing metrics
+                position_notional = position * exec_price
+                position_notionals.append(position_notional)
+                
+                # Calculate actual risk used
+                if stop_price is not None and stop_price > 0:
+                    stop_distance = exec_price - stop_price
+                    risk_amount = position * stop_distance
+                    equity_before_entry = equity + entry_cost  # equity before this entry
+                    risk_pct = risk_amount / equity_before_entry if equity_before_entry > 0 else 0
+                    risk_amounts_used.append(risk_pct)
+                
                 # Deduct cash spent from equity
                 equity = equity - entry_cost
     
@@ -557,6 +577,10 @@ def run_backtest(
     total_costs = total_fees_paid + total_slippage_cost
     cost_as_pct = (total_costs / gross_pnl * 100) if gross_pnl > 0 else 0.0
     
+    # Calculate avg position sizing metrics
+    avg_position_notional = sum(position_notionals) / len(position_notionals) if position_notionals else 0.0
+    avg_risk_used = sum(risk_amounts_used) / len(risk_amounts_used) if risk_amounts_used else 0.0
+    
     result = BacktestResult(
         run_id=run_id, strategy_name=strategy_name, symbol=symbol,
         timeframe=timeframe, start_date=start_date, end_date=end_date,
@@ -568,6 +592,8 @@ def run_backtest(
         total_fees_paid=round(total_fees_paid, 2),
         total_slippage_cost=round(total_slippage_cost, 2),
         cost_as_pct_of_gross_pnl=round(cost_as_pct, 2),
+        avg_position_notional=round(avg_position_notional, 2),
+        avg_risk_used_per_trade=round(avg_risk_used, 4),
         **metrics,
     )
     
@@ -681,6 +707,10 @@ def print_backtest_summary(result: BacktestResult):
     print(f"Profit Factor:  {result.profit_factor:.2f}")
     print(f"Avg Return:     {result.avg_trade_return_pct:.2f}%")
     print(f"Avg Duration:   {result.avg_trade_duration_hours:.1f}h")
+    print("-" * 60)
+    print(f"POSITION SIZING:")
+    print(f"  Avg Notional:  ${result.avg_position_notional:,.2f}")
+    print(f"  Avg Risk/Trade:{result.avg_risk_used_per_trade*100:.2f}%")
     print("-" * 60)
     print(f"COST BREAKDOWN:")
     print(f"  Fees Paid:     ${result.total_fees_paid:,.2f}")
