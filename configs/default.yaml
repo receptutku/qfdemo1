@@ -1,0 +1,25 @@
+# Default configuration for BTC Backtesting
+
+# Data settings
+data:
+  symbol: "BTC/USDT"
+  timeframe: "1h"
+  exchange: "binance"
+
+# Backtest settings
+backtest:
+  initial_capital: 10000.0
+  fee_pct: 0.001        # 0.1% per trade
+  slippage_pct: 0.0005  # 0.05% slippage
+
+# Strategy defaults
+strategies:
+  sma_atr:
+    fast_period: 20
+    slow_period: 50
+    atr_period: 14
+    atr_multiplier: 2.0
+  
+  sma:
+    fast_period: 20
+    slow_period: 50

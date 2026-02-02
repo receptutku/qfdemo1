@@ -1,0 +1,40 @@
+# SMA-ATR Trend Following Strategy Configuration
+# BTC-only TRAIN phase
+
+strategy:
+  name: sma_atr
+  description: "SMA crossover with ATR-based stop-loss"
+
+# Indicator parameters (optimized)
+indicators:
+  sma_fast: 40          # Fast SMA period (was 20)
+  sma_slow: 100         # Slow SMA period (was 50)
+  atr_period: 14        # ATR period
+
+# Stop-loss configuration
+stops:
+  atr_multiplier: 2.0   # k value: stop = entry - k * ATR
+  trailing_stop: false  # Enable trailing stop (highest_close - k * ATR)
+
+# Regime filter (ADX-based)
+filter:
+  enabled: true         # Set to true to enable ADX filter
+  adx_threshold: 25     # Only enter when ADX >= threshold
+  adx_period: 14        # ADX calculation period
+
+# Trend Confirmation (Slope-based)
+slope_filter:
+  enabled: true         # Require SMA_slow slope > 0
+  lookback: 10          # Bars to look back for slope calc
+
+# Execution costs
+execution:
+  fee_pct: 0.0006       # 0.06% per trade (baseline)
+  slippage_bps: 1       # Min slippage (volatility model used in backtest)
+
+# Position sizing
+position:
+  sizing_mode: risk_per_trade    # "all_in" | "risk_per_trade"
+  size_pct: 1.0          # 100% of equity per trade (for all_in mode)
+  risk_per_trade: 0.01   # 1% risk per trade (for risk_per_trade mode)
+  max_leverage: 1.0      # Max leverage (1.0 for spot)
