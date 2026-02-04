@@ -86,10 +86,36 @@ def cmd_backtest(args):
     """Run single backtest."""
     from src.backtest import run_backtest, print_backtest_summary
     
+    exchange = getattr(args, 'exchange', None)
+    sizing_mode = getattr(args, 'sizing_mode', 'all_in')
+    risk_per_trade = getattr(args, 'risk_per_trade', 0.01)
+    max_leverage = getattr(args, 'max_leverage', 1.0)
+    
     print(f"[Backtest] Strategy: {args.strategy}")
     print(f"[Backtest] Symbol: {args.symbol}, TF: {args.tf}")
     print(f"[Backtest] Period: {args.start} to {args.end}")
     print(f"[Backtest] Cost Profile: {args.cost_profile}")
+    print(f"[Backtest] Sizing Mode: {sizing_mode}" + (f" (risk={risk_per_trade*100:.1f}%)" if sizing_mode == 'risk_per_trade' else ""))
+    
+    # If exchange is vectorbt, fetch data directly and save to cache
+    if exchange == "vectorbt":
+        from src.data.providers.vectorbt_provider import VectorBTProvider
+        import pandas as pd
+        
+        provider = VectorBTProvider()
+        print(f"[Backtest] Fetching data via VectorBT...")
+        df = provider.fetch_range(
+            symbol=args.symbol,
+            timeframe=args.tf,
+            start_date=args.start,
+            end_date=args.end,
+        )
+        
+        if not df.empty:
+            # Save to cache for backtest engine to use
+            cache_path = DATA_DIR / f"{args.symbol.replace('/', '_')}_{args.tf}.parquet"
+            df.to_parquet(cache_path, engine="pyarrow")
+            print(f"[Backtest] Cached {len(df)} candles to {cache_path}")
     
     result = run_backtest(
         strategy_name=args.strategy,
@@ -100,20 +126,60 @@ def cmd_backtest(args):
         initial_capital=args.capital,
         position_size_pct=args.position_size,
         cost_profile=args.cost_profile,
+        sizing_mode=sizing_mode,
+        risk_per_trade=risk_per_trade,
+        max_leverage=max_leverage,
         save_reports=True,
     )
     
     print_backtest_summary(result)
+    return result
 
 
 def cmd_walkforward(args):
     """Run walk-forward analysis."""
     from src.walkforward import run_walk_forward, print_walk_forward_summary
     
+    exchange = getattr(args, 'exchange', None)
+    
     print(f"[WalkForward] Strategy: {args.strategy}")
+    print(f"[WalkForward] Symbol: {args.symbol}, TF: {args.tf}")
     print(f"[WalkForward] Period: {args.start} to {args.end}")
     print(f"[WalkForward] Config: Train={args.train_days}d, Test={args.test_days}d, Step={args.step_days}d")
     print(f"[WalkForward] Mode: {args.wf_mode}, Min Trades: {args.min_trades}")
+    
+    # If exchange is vectorbt, fetch data directly and save to cache
+    if exchange == "vectorbt":
+        from src.data.providers.vectorbt_provider import VectorBTProvider
+        
+        provider = VectorBTProvider()
+        print(f"[WalkForward] Fetching {args.tf} data via VectorBT...")
+        df = provider.fetch_range(
+            symbol=args.symbol,
+            timeframe=args.tf,
+            start_date=args.start,
+            end_date=args.end,
+        )
+        
+        if not df.empty:
+            # Save to cache for walkforward engine to use
+            cache_path = DATA_DIR / f"{args.symbol.replace('/', '_')}_{args.tf}.parquet"
+            df.to_parquet(cache_path, engine="pyarrow")
+            print(f"[WalkForward] Cached {len(df)} candles to {cache_path}")
+        
+        # Also fetch daily data for regime filter if not 1d
+        if args.tf != "1d":
+            print(f"[WalkForward] Fetching 1d data for regime filter...")
+            daily_df = provider.fetch_range(
+                symbol=args.symbol,
+                timeframe="1d",
+                start_date=args.start,
+                end_date=args.end,
+            )
+            if not daily_df.empty:
+                daily_cache_path = DATA_DIR / f"{args.symbol.replace('/', '_')}_1d.parquet"
+                daily_df.to_parquet(daily_cache_path, engine="pyarrow")
+                print(f"[WalkForward] Cached {len(daily_df)} daily candles")
     
     result = run_walk_forward(
         strategy_name=args.strategy,
@@ -133,7 +199,22 @@ def cmd_walkforward(args):
     )
     
     print_walk_forward_summary(result)
-    print(f"\n[WalkForward] Reports: reports/walkforward/{result.run_id}")
+    
+    # Print condensed key metrics
+    print("\n" + "=" * 80)
+    print("KEY METRICS SUMMARY")
+    print("=" * 80)
+    print(f"percent_low_sample_splits:    {result.percent_low_sample_splits:.1f}%")
+    print(f"filtered_percent_profitable:  {result.filtered_splits.profitable_splits_pct:.1f}%")
+    print(f"filtered_median_return:       {result.filtered_splits.median_return:.2f}%")
+    print(f"worst_split_drawdown:         {result.all_splits.worst_drawdown:.2f}%")
+    print(f"filtered_median_trades:       {result.filtered_splits.median_trades:.0f}")
+    print(f"stability_score (all):        {result.all_splits.stability_score:.3f}")
+    print(f"stability_score (filtered):   {result.filtered_splits.stability_score:.3f}")
+    print("=" * 80)
+    
+    print(f"\n[WalkForward] Reports: reports/walkforward/{result.run_id}/")
+    return result
 
 
 def cmd_info(args):
@@ -162,30 +243,59 @@ def cmd_info(args):
 def cmd_audit(args):
     """Run data audit for correctness verification."""
     from src.audit import audit_data, save_audit_report, print_audit_summary
-    from src.data_loader import load_ohlcv
     
+    exchange = getattr(args, 'exchange', 'vectorbt')
     print(f"[Audit] Symbol: {args.symbol}, TF: {args.tf}")
     print(f"[Audit] Period: {args.start} to {args.end}")
+    print(f"[Audit] Exchange: {exchange}")
     
-    # Load data
-    df = load_ohlcv(
-        symbol=args.symbol,
-        timeframe=args.tf,
-        data_dir=DATA_DIR,
-        start_date=args.start,
-        end_date=args.end,
-    )
-    
-    # Determine canonical symbol (from VectorBT mapping if available)
+    # Determine canonical symbol and fetch data
     canonical = None
-    try:
+    data_source = exchange
+    
+    if exchange == "vectorbt":
         from src.data.providers.vectorbt_provider import VectorBTProvider
         provider = VectorBTProvider()
         canonical = provider.normalize_symbol(args.symbol)
-    except:
-        pass
+        data_source = f"vectorbt/yfinance (via {canonical})"
+        
+        print(f"[Audit] Fetching data via VectorBT...")
+        df = provider.fetch_range(
+            symbol=args.symbol,
+            timeframe=args.tf,
+            start_date=args.start,
+            end_date=args.end,
+        )
+    else:
+        # Try to load from cache first
+        from src.data_loader import load_ohlcv
+        try:
+            df = load_ohlcv(
+                symbol=args.symbol,
+                timeframe=args.tf,
+                data_dir=DATA_DIR,
+                start_date=args.start,
+                end_date=args.end,
+            )
+        except FileNotFoundError:
+            print(f"[Audit] No cached data, attempting to fetch via {exchange}...")
+            from src.data.live_fetcher import update_ohlcv
+            update_ohlcv(
+                symbol=args.symbol,
+                timeframe=args.tf,
+                start_date=args.start,
+                exchange=exchange,
+                data_dir=DATA_DIR,
+            )
+            df = load_ohlcv(
+                symbol=args.symbol,
+                timeframe=args.tf,
+                data_dir=DATA_DIR,
+                start_date=args.start,
+                end_date=args.end,
+            )
     
-    # Find data file
+    # Find data file path (for reference)
     data_file = DATA_DIR / f"{args.symbol.replace('/', '_')}_{args.tf}.parquet"
     
     # Run audit
@@ -194,7 +304,7 @@ def cmd_audit(args):
         timeframe=args.tf,
         df=df,
         canonical_symbol=canonical,
-        data_source="vectorbt/yfinance",
+        data_source=data_source,
         data_file=str(data_file),
         stop_fill_mode=args.stop_fill_mode,
         fee_pct=args.fee,
@@ -255,14 +365,25 @@ def main():
     bt.add_argument("--position-size", type=float, default=1.0)
     bt.add_argument("--cost_profile", default="baseline", choices=["baseline", "high"],
                     help="Cost profile: baseline (fee=0.06%%, slip_k=0.15) or high (fee=0.12%%, slip_k=0.30)")
+    bt.add_argument("--exchange", default=None, help="Data provider (vectorbt, okx, etc.)")
+    bt.add_argument("--config", default=None, help="Strategy config YAML file")
+    bt.add_argument("--sizing_mode", default="all_in", choices=["all_in", "risk_per_trade"],
+                    help="Position sizing mode")
+    bt.add_argument("--risk_per_trade", type=float, default=0.01,
+                    help="Risk per trade as fraction (e.g., 0.01 = 1%%)")
+    bt.add_argument("--max_leverage", type=float, default=1.0, help="Max leverage (1.0 for spot)")
 
     # Walk-Forward
+    # Presets:
+    #   1h (2 years): train_days=240, test_days=180, step_days=60, min_trades=5
+    #   1d (2019+):   train_days=720, test_days=365, step_days=180, min_trades=5
     wf = subparsers.add_parser("walkforward", help="Run walk-forward analysis")
     wf.add_argument("--strategy", required=True)
     wf.add_argument("--symbol", default="BTC/USDT")
     wf.add_argument("--tf", default="1h")
     wf.add_argument("--start", required=True)
     wf.add_argument("--end", required=True)
+    wf.add_argument("--exchange", default=None, help="Data provider (vectorbt, okx, etc.)")
     wf.add_argument("--train_days", type=int, default=240)
     wf.add_argument("--test_days", type=int, default=90)
     wf.add_argument("--step_days", type=int, default=30)
@@ -285,12 +406,25 @@ def main():
     au.add_argument("--tf", default="1h")
     au.add_argument("--start", required=True)
     au.add_argument("--end", required=True)
+    au.add_argument("--exchange", default="vectorbt", help="Data provider (vectorbt, okx, etc.)")
     au.add_argument("--stop_fill_mode", default="intrabar", choices=["intrabar", "next_open"])
     au.add_argument("--fee", type=float, default=0.0005)
     au.add_argument("--slippage", type=float, default=5.0)
 
     # Diagnose
     diag = subparsers.add_parser("diagnose", help="Network diagnostics")
+
+    # Evaluate Holdout
+    ho = subparsers.add_parser("evaluate_holdout", help="Evaluate strategy on DEV and HOLDOUT sets")
+    ho.add_argument("--strategy", required=True)
+    ho.add_argument("--symbol", default="BTC/USDT")
+    ho.add_argument("--tf", default="1h")
+    ho.add_argument("--start", default="2024-02-15", help="DEV start date")
+    ho.add_argument("--dev_end", required=True, help="DEV end date")
+    ho.add_argument("--holdout_start", required=True, help="HOLDOUT start date")
+    ho.add_argument("--end", required=True, help="HOLDOUT end date")
+    ho.add_argument("--exchange", default="vectorbt", help="Data provider")
+    ho.add_argument("--cost_profile", default="baseline", choices=["baseline", "high"])
 
     args = parser.parse_args()
     ensure_directories()
@@ -308,6 +442,7 @@ def main():
         "info": cmd_info,
         "audit": cmd_audit,
         "diagnose": cmd_diagnose,
+        "evaluate_holdout": cmd_evaluate_holdout,
     }
     
     commands[args.command](args)
@@ -317,6 +452,199 @@ def cmd_diagnose(args):
     """Run network diagnostics."""
     from src.data.network_utils import print_network_diagnostics
     print_network_diagnostics()
+
+
+def cmd_evaluate_holdout(args):
+    """
+    Evaluate strategy on DEV and HOLDOUT sets.
+    
+    DEV: start to dev_end (for development/tuning - log only)
+    HOLDOUT: holdout_start to end (final evaluation - run once)
+    """
+    import json
+    import uuid
+    from datetime import datetime
+    from src.backtest import run_backtest, print_backtest_summary
+    
+    exchange = getattr(args, 'exchange', None)
+    start_date = getattr(args, 'start', '2024-02-15')
+    
+    print("\n" + "="*100)
+    print(" HOLDOUT EVALUATION PROTOCOL ".center(100, "="))
+    print("="*100)
+    print(f"Strategy: {args.strategy}")
+    print(f"Symbol: {args.symbol}, TF: {args.tf}")
+    print(f"Cost Profile: {args.cost_profile}")
+    print(f"DEV Period:     {start_date} to {args.dev_end}")
+    print(f"HOLDOUT Period: {args.holdout_start} to {args.end}")
+    print("="*100)
+    
+    # Fetch data if using vectorbt
+    if exchange == "vectorbt":
+        from src.data.providers.vectorbt_provider import VectorBTProvider
+        
+        provider = VectorBTProvider()
+        print(f"\n[Holdout] Fetching {args.tf} data via VectorBT...")
+        df = provider.fetch_range(
+            symbol=args.symbol,
+            timeframe=args.tf,
+            start_date=start_date,
+            end_date=args.end,
+        )
+        
+        if not df.empty:
+            cache_path = DATA_DIR / f"{args.symbol.replace('/', '_')}_{args.tf}.parquet"
+            df.to_parquet(cache_path, engine="pyarrow")
+            print(f"[Holdout] Cached {len(df)} candles to {cache_path}")
+        
+        # Also fetch daily data for regime filter if not 1d
+        if args.tf != "1d":
+            print(f"[Holdout] Fetching 1d data for regime filter...")
+            daily_df = provider.fetch_range(
+                symbol=args.symbol,
+                timeframe="1d",
+                start_date=start_date,
+                end_date=args.end,
+            )
+            if not daily_df.empty:
+                daily_cache_path = DATA_DIR / f"{args.symbol.replace('/', '_')}_1d.parquet"
+                daily_df.to_parquet(daily_cache_path, engine="pyarrow")
+                print(f"[Holdout] Cached {len(daily_df)} daily candles")
+    
+    # Run DEV backtest
+    print(f"\n{'#'*100}")
+    print(f"DEV SET BACKTEST: {start_date} to {args.dev_end}")
+    print(f"{'#'*100}")
+    
+    dev_result = run_backtest(
+        strategy_name=args.strategy,
+        symbol=args.symbol,
+        timeframe=args.tf,
+        start_date=start_date,
+        end_date=args.dev_end,
+        cost_profile=args.cost_profile,
+        sizing_mode="risk_per_trade",
+        risk_per_trade=0.01,
+        save_reports=False,
+    )
+    
+    # Run HOLDOUT backtest
+    print(f"\n{'#'*100}")
+    print(f"HOLDOUT SET BACKTEST: {args.holdout_start} to {args.end}")
+    print(f"{'#'*100}")
+    
+    holdout_result = run_backtest(
+        strategy_name=args.strategy,
+        symbol=args.symbol,
+        timeframe=args.tf,
+        start_date=args.holdout_start,
+        end_date=args.end,
+        cost_profile=args.cost_profile,
+        sizing_mode="risk_per_trade",
+        risk_per_trade=0.01,
+        save_reports=False,
+    )
+    
+    # Calculate metrics
+    def calc_metrics(result):
+        total_return = (result.final_equity / result.initial_capital - 1) * 100
+        total_costs = result.total_fees_paid + result.total_slippage_cost
+        return {
+            "return_pct": round(total_return, 2),
+            "max_drawdown_pct": round(result.max_drawdown_pct, 2),
+            "profit_factor": round(result.profit_factor, 2),
+            "sharpe_ratio": round(result.sharpe_ratio, 3),
+            "trades": result.total_trades,
+            "total_costs": round(total_costs, 2),
+            "win_rate_pct": round(result.win_rate_pct, 1),
+        }
+    
+    dev_metrics = calc_metrics(dev_result)
+    holdout_metrics = calc_metrics(holdout_result)
+    
+    # Print side-by-side comparison
+    print("\n")
+    print("="*100)
+    print(" HOLDOUT EVALUATION RESULTS ".center(100, "="))
+    print("="*100)
+    print(f"Cost Profile: {args.cost_profile.upper()}")
+    print("-"*100)
+    print(f"{'Metric':<25} | {'DEV':>20} | {'HOLDOUT':>20} | {'Delta':>15} | {'Check':>10}")
+    print("-"*100)
+    
+    metrics_config = [
+        ("return_pct", "Return", "%", 2, "higher_better"),
+        ("max_drawdown_pct", "Max Drawdown", "%", 2, "lower_better"),
+        ("profit_factor", "Profit Factor", "", 2, "higher_better"),
+        ("sharpe_ratio", "Sharpe Ratio", "", 3, "higher_better"),
+        ("trades", "Trades", "", 0, "similar"),
+        ("total_costs", "Total Costs", "$", 2, "lower_better"),
+        ("win_rate_pct", "Win Rate", "%", 1, "higher_better"),
+    ]
+    
+    for key, name, unit, decimals, check_type in metrics_config:
+        dv = dev_metrics[key]
+        hv = holdout_metrics[key]
+        delta = hv - dv
+        
+        # Determine check symbol
+        if check_type == "higher_better":
+            check = "✓" if hv >= dv * 0.7 else "⚠"  # Allow 30% degradation
+        elif check_type == "lower_better":
+            check = "✓" if hv <= dv * 1.3 else "⚠"  # Allow 30% worse
+        else:
+            check = "~"
+        
+        if unit == "$":
+            print(f"{name:<25} | ${dv:>18.{decimals}f} | ${hv:>18.{decimals}f} | {delta:>+14.{decimals}f} | {check:>10}")
+        elif unit == "%":
+            print(f"{name:<25} | {dv:>18.{decimals}f}{unit} | {hv:>18.{decimals}f}{unit} | {delta:>+14.{decimals}f}{unit} | {check:>10}")
+        else:
+            print(f"{name:<25} | {dv:>19.{decimals}f} | {hv:>19.{decimals}f} | {delta:>+15.{decimals}f} | {check:>10}")
+    
+    print("="*100)
+    
+    # Assess holdout performance
+    print("\nHOLDOUT ASSESSMENT:")
+    
+    issues = []
+    if holdout_metrics["return_pct"] < dev_metrics["return_pct"] * 0.5:
+        issues.append(f"Return degraded significantly ({holdout_metrics['return_pct']:.1f}% vs {dev_metrics['return_pct']:.1f}%)")
+    if holdout_metrics["profit_factor"] < 1.0:
+        issues.append(f"Profit factor below 1.0 ({holdout_metrics['profit_factor']:.2f})")
+    if holdout_metrics["max_drawdown_pct"] < dev_metrics["max_drawdown_pct"] * 1.5:
+        issues.append(f"Drawdown worse than expected ({holdout_metrics['max_drawdown_pct']:.1f}% vs {dev_metrics['max_drawdown_pct']:.1f}%)")
+    
+    if not issues:
+        print("  ✓ Holdout performance is acceptable relative to DEV")
+    else:
+        for issue in issues:
+            print(f"  ⚠ {issue}")
+    
+    # Save report
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    report_dir = REPORTS_DIR / "holdout" / run_id
+    report_dir.mkdir(parents=True, exist_ok=True)
+    
+    report_data = {
+        "run_id": run_id,
+        "strategy": args.strategy,
+        "symbol": args.symbol,
+        "timeframe": args.tf,
+        "cost_profile": args.cost_profile,
+        "dev_period": f"{start_date} to {args.dev_end}",
+        "holdout_period": f"{args.holdout_start} to {args.end}",
+        "dev_metrics": dev_metrics,
+        "holdout_metrics": holdout_metrics,
+        "issues": issues,
+    }
+    
+    with open(report_dir / "holdout_report.json", "w") as f:
+        json.dump(report_data, f, indent=2)
+    
+    print(f"\n[Holdout] Report saved: {report_dir}/")
+    
+    return report_data
 
 
 if __name__ == "__main__":
